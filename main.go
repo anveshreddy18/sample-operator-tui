@@ -46,6 +46,7 @@ const (
 	ListState AppState = iota
 	LogState
 	DescribeState
+	ContainerSelectState // New state for selecting a container
 )
 
 // Model holds our application state
@@ -61,6 +62,8 @@ type Model struct {
 	etcdName      string
 	content       string
 	err           error
+	containerList list.Model // List for containers in a pod
+	containers    []string   // Names of containers in the selected pod
 }
 
 // Kubernetes client setup - this is where we establish connection to the cluster
@@ -155,21 +158,34 @@ func (m *Model) fetchEtcdPods() ([]Pod, error) {
 	return pods, nil
 }
 
-// getPodLogs retrieves logs for the selected pod
-// This demonstrates how to stream logs from Kubernetes API
-func (m *Model) getPodLogs(podName string) (string, error) {
+// fetchPodContainers retrieves the list of containers for a given pod
+func (m *Model) fetchPodContainers(podName string) ([]string, error) {
+	pod, err := m.kubeClient.CoreV1().Pods(m.namespace).Get(
+		context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pod %s: %w", podName, err)
+	}
+	var containers []string
+	for _, c := range pod.Spec.Containers {
+		containers = append(containers, c.Name)
+	}
+	return containers, nil
+}
+
+// getPodLogs retrieves logs for the selected pod and container
+func (m *Model) getPodLogs(podName, container string) (string, error) {
 	// Configure log retrieval options
 	// TailLines limits output to prevent overwhelming the terminal
 	tailLines := int64(100)
 	req := m.kubeClient.CoreV1().Pods(m.namespace).GetLogs(podName, &corev1.PodLogOptions{
 		TailLines: &tailLines,
-		Container: "backup-restore", // Always use backup-restore container for now
+		Container: container,
 	})
 
 	// Execute the request and read the response
 	logs, err := req.Stream(context.Background())
 	if err != nil {
-		return "", fmt.Errorf("failed to get logs for pod %s: %w", podName, err)
+		return "", fmt.Errorf("failed to get logs for pod %s (container %s): %w", podName, container, err)
 	}
 	defer logs.Close()
 
@@ -244,6 +260,8 @@ type podsLoadedMsg struct{ pods []Pod }
 type errMsg struct{ err error }
 type logsLoadedMsg struct{ content string }
 type describeLoadedMsg struct{ content string }
+type containersLoadedMsg struct{ containers []string }
+type containerSelectedMsg struct{ container string }
 
 // Update handles all state changes in response to messages
 // This is the heart of the Elm architecture - pure function that transforms state
@@ -259,16 +277,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "q", "ctrl+c":
 				return m, tea.Quit
 			case "l":
-				// Load logs for selected pod
+				// Load containers for selected pod and show container selection
 				if len(m.pods) > 0 {
 					m.selectedPod = m.pods[m.list.Index()]
-					m.state = LogState
+					m.state = ContainerSelectState
 					return m, func() tea.Msg {
-						content, err := m.getPodLogs(m.selectedPod.Name)
+						containers, err := m.fetchPodContainers(m.selectedPod.Name)
 						if err != nil {
 							return errMsg{err}
 						}
-						return logsLoadedMsg{content}
+						return containersLoadedMsg{containers}
 					}
 				}
 			case "d":
@@ -303,6 +321,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport, cmd = m.viewport.Update(msg)
 				cmds = append(cmds, cmd)
 			}
+		case ContainerSelectState:
+			switch msg.String() {
+			case "q", "esc":
+				m.state = ListState
+				return m, nil
+			case "enter":
+				if len(m.containers) > 0 {
+					selected := m.containers[m.containerList.Index()]
+					return m, func() tea.Msg {
+						return containerSelectedMsg{container: selected}
+					}
+				}
+			default:
+				m.containerList, cmd = m.containerList.Update(msg)
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	case podsLoadedMsg:
@@ -318,10 +352,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logsLoadedMsg:
 		m.content = msg.content
 		m.viewport.SetContent(m.content)
+		m.state = LogState
+		return m, nil
 
 	case describeLoadedMsg:
 		m.content = msg.content
 		m.viewport.SetContent(m.content)
+
+	case containersLoadedMsg:
+		m.containers = msg.containers
+		items := make([]list.Item, len(msg.containers))
+		for i, c := range msg.containers {
+			items[i] = listItemString(c)
+		}
+		delegate := list.NewDefaultDelegate()
+		containerList := list.New(items, delegate, m.list.Width(), m.list.Height())
+		containerList.Title = "Containers"
+		containerList.SetShowStatusBar(false)
+		containerList.SetFilteringEnabled(false)
+		containerList.SetShowHelp(false)
+		m.containerList = containerList
+		m.state = ContainerSelectState
+		return m, nil
+
+	case containerSelectedMsg:
+		if m.selectedPod.Name != "" && msg.container != "" {
+			return m, func() tea.Msg {
+				content, err := m.getPodLogs(m.selectedPod.Name, msg.container)
+				if err != nil {
+					return errMsg{err}
+				}
+				return logsLoadedMsg{content}
+			}
+		}
+		return m, nil
 
 	case errMsg:
 		m.err = msg.err
@@ -360,6 +424,11 @@ func (m Model) View() string {
 		header := headerStyle.Render(fmt.Sprintf("Describe: %s", m.selectedPod.Name))
 		help := helpStyle.Render("• esc: back • q: quit • ↑/↓: scroll")
 		return fmt.Sprintf("%s\n%s\n%s", header, m.viewport.View(), help)
+
+	case ContainerSelectState:
+		header := headerStyle.Render(fmt.Sprintf("Select Container: %s", m.selectedPod.Name))
+		help := helpStyle.Render("• enter: select • esc: back • q: quit")
+		return fmt.Sprintf("%s\n%s\n%s", header, m.containerList.View(), help)
 	}
 
 	return ""
@@ -378,6 +447,15 @@ var (
 			Foreground(lipgloss.Color("240")).
 			MarginTop(1)
 )
+
+// listItemString wraps a string to implement the list.Item interface for Bubbletea lists
+// Used for displaying container names in the container selection list
+
+type listItemString string
+
+func (s listItemString) Title() string       { return string(s) }
+func (s listItemString) Description() string { return "" }
+func (s listItemString) FilterValue() string { return string(s) }
 
 func main() {
 	// Parse command line arguments - k9s passes context information this way
