@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -47,6 +48,7 @@ const (
 	LogState
 	DescribeState
 	ContainerSelectState // New state for selecting a container
+	YamlState
 )
 
 // Model holds our application state
@@ -172,6 +174,20 @@ func (m *Model) fetchPodContainers(podName string) ([]string, error) {
 	return containers, nil
 }
 
+// fetchPodYAML retrieves the YAML configuration for a given pod
+func (m *Model) fetchPodYAML(podName string) (string, error) {
+	pod, err := m.kubeClient.CoreV1().Pods(m.namespace).Get(
+		context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get pod %s: %w", podName, err)
+	}
+	b, err := yaml.Marshal(pod)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal pod to yaml: %w", err)
+	}
+	return string(b), nil
+}
+
 // getPodLogs retrieves logs for the selected pod and container
 func (m *Model) getPodLogs(podName, container string) (string, error) {
 	// Configure log retrieval options
@@ -262,6 +278,7 @@ type logsLoadedMsg struct{ content string }
 type describeLoadedMsg struct{ content string }
 type containersLoadedMsg struct{ containers []string }
 type containerSelectedMsg struct{ container string }
+type yamlLoadedMsg struct{ content string }
 
 // Update handles all state changes in response to messages
 // This is the heart of the Elm architecture - pure function that transforms state
@@ -351,6 +368,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "r":
 				// Refresh pod list
 				return m, m.loadPods()
+			case "y":
+				// Show YAML for selected pod
+				if len(m.pods) > 0 {
+					m.selectedPod = m.pods[m.list.Index()]
+					m.state = YamlState
+					return m, func() tea.Msg {
+						content, err := m.fetchPodYAML(m.selectedPod.Name)
+						if err != nil {
+							return errMsg{err}
+						}
+						return yamlLoadedMsg{content}
+					}
+				}
 			default:
 				m.list, cmd = m.list.Update(msg)
 				cmds = append(cmds, cmd)
@@ -390,6 +420,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			default:
 				m.containerList, cmd = m.containerList.Update(msg)
+				cmds = append(cmds, cmd)
+			}
+		case YamlState:
+			switch msg.String() {
+			case "q", "esc":
+				m.state = ListState
+				m.content = ""
+			default:
+				m.viewport, cmd = m.viewport.Update(msg)
 				cmds = append(cmds, cmd)
 			}
 		}
@@ -442,6 +481,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case yamlLoadedMsg:
+		m.content = msg.content
+		m.viewport.SetContent(m.content)
+		m.state = YamlState
+
 	case errMsg:
 		m.err = msg.err
 		m.list.StopSpinner()
@@ -484,6 +528,11 @@ func (m Model) View() string {
 		header := headerStyle.Render(fmt.Sprintf("Select Container: %s", m.selectedPod.Name))
 		help := helpStyle.Render("• enter: select • esc: back • q: quit")
 		return fmt.Sprintf("%s\n%s\n%s", header, m.containerList.View(), help)
+
+	case YamlState:
+		header := headerStyle.Render(fmt.Sprintf("YAML Config: %s", m.selectedPod.Name))
+		help := helpStyle.Render("• esc: back • q: quit • ↑/↓: scroll")
+		return fmt.Sprintf("%s\n%s\n%s", header, m.viewport.View(), help)
 	}
 
 	return ""
