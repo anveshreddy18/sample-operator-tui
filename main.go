@@ -271,10 +271,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
 		switch m.state {
 		case ListState:
 			switch msg.String() {
-			case "q", "ctrl+c":
+			case "q":
 				return m, tea.Quit
 			case "l":
 				// Load containers for selected pod and show container selection
@@ -309,14 +312,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.list, cmd = m.list.Update(msg)
 				cmds = append(cmds, cmd)
 			}
-		case LogState, DescribeState:
+		case LogState:
 			switch msg.String() {
-			case "q", "esc":
-				// Return to list view
+			case "q":
 				m.state = ListState
 				m.content = ""
-			case "ctrl+c":
-				return m, tea.Quit
+			case "esc":
+				m.state = ContainerSelectState
+				m.content = ""
+			default:
+				m.viewport, cmd = m.viewport.Update(msg)
+				cmds = append(cmds, cmd)
+			}
+		case DescribeState:
+			switch msg.String() {
+			case "q", "esc":
+				m.state = ListState
+				m.content = ""
 			default:
 				m.viewport, cmd = m.viewport.Update(msg)
 				cmds = append(cmds, cmd)
