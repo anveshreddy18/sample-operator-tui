@@ -274,6 +274,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		if msg.String() == "r" {
+			switch m.state {
+			case ListState:
+				return m, m.loadPods()
+			case LogState:
+				if m.selectedPod.Name != "" && m.content != "" {
+					container := ""
+					if len(m.containers) > 0 && m.containerList.Index() >= 0 && m.containerList.Index() < len(m.containers) {
+						container = m.containers[m.containerList.Index()]
+					}
+					if container == "" {
+						container = m.selectedPod.Name // fallback, but should not happen
+					}
+					return m, func() tea.Msg {
+						content, err := m.getPodLogs(m.selectedPod.Name, container)
+						if err != nil {
+							return errMsg{err}
+						}
+						return logsLoadedMsg{content}
+					}
+				}
+			case DescribeState:
+				if m.selectedPod.Name != "" {
+					return m, func() tea.Msg {
+						content, err := m.describePod(m.selectedPod.Name)
+						if err != nil {
+							return errMsg{err}
+						}
+						return describeLoadedMsg{content}
+					}
+				}
+			case ContainerSelectState:
+				if m.selectedPod.Name != "" {
+					return m, func() tea.Msg {
+						containers, err := m.fetchPodContainers(m.selectedPod.Name)
+						if err != nil {
+							return errMsg{err}
+						}
+						return containersLoadedMsg{containers}
+					}
+				}
+			}
+		}
 		switch m.state {
 		case ListState:
 			switch msg.String() {
